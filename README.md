@@ -31,6 +31,29 @@ You can run it locally with Docker Compose or Podman, deploy it at scale in a Ku
 
 > **Need a hosted LLM provider?** AudioMuse-AI supports OpenAI-compatible APIs through the existing `OPENAI` provider. [Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=AudioMuse-AI) is one hosted option you can configure this way; see the [configuration parameters](docs/PARAMETERS.md#openai-compatible-hosted-providers) for details.
 
+> ### 🔀 This fork: swappable sonic backends (MusiCNN / MERT)
+>
+> This fork adds a **pluggable sonic-analysis backend** selected with the
+> `SONIC_BACKEND` environment variable, so you can choose which model produces
+> the per-track similarity embedding that every downstream feature is built on:
+>
+> * **`musicnn`** *(default)* — the original AudioMuse path (200-dim ONNX
+>   embedding). Unchanged; leave `SONIC_BACKEND` unset to keep prior behavior.
+> * **`mert`** — the self-supervised [MERT](https://huggingface.co/m-a-p/MERT-v1-330M)
+>   music foundation model (768-dim @ `MERT-v1-95M`, 1024-dim @ `MERT-v1-330M`,
+>   via 🤗 transformers) for a richer similarity embedding, while the MusiCNN
+>   prediction head still produces the mood/genre tags so `mood_vector` stays
+>   schema-compatible.
+>
+> Each backend stores its embeddings under its own `backend` namespace
+> (composite `(item_id, backend)` key), so running one backend never destroys
+> another's data — but their embedding dimensions differ, so **switching
+> backends requires a full re-analysis**. Mood centroids are derived
+> per-backend at the end of each analysis. MERT benefits from a GPU; set
+> `ONNX_FORCE_CPU=true` to keep MusiCNN/CLAP on the CPU so only MERT uses the
+> device. See **[docs/SONIC_BACKENDS.md](docs/SONIC_BACKENDS.md)** for the full
+> configuration reference and how to add your own backend.
+
 AudioMuse-AI lets you explore your music library in innovative ways, just **start with an initial analysis**, and you’ll unlock features like:
 * **Clustering**: Automatically groups sonically similar songs, creating genre-defying playlists based on the music's actual sound.
 * **Instant Playlists**: Simply tell the AI what you want to hear-like "high-tempo, low-energy music" and it will instantly generate a playlist for you.
