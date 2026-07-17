@@ -71,8 +71,8 @@ from . import helper as _ah
 from .helper import make_task_reporter, _bind_server_context
 from .song import (
     analyze_track,
-    cleanup_musicnn_sessions,
     cleanup_optional_models,
+    release_album_sessions,
     robust_load_audio_with_fallback,
 )
 
@@ -450,7 +450,7 @@ def _analyze_album_task_impl(album_id, album_name, top_n_moods, parent_task_id):
 
             _ah.flush_pending_track_maps(pending_track_maps, map_flush_errors, album_name)
 
-            cleanup_musicnn_sessions(onnx_sessions, context="album end")
+            release_album_sessions(onnx_sessions, context="album end")
             onnx_sessions = None
             cleanup_optional_models(context="album end")
             comprehensive_memory_cleanup(force_cuda=True, reset_onnx_pool=True)
@@ -498,7 +498,7 @@ def _analyze_album_task_impl(album_id, album_name, top_n_moods, parent_task_id):
             )
             raise
         finally:
-            cleanup_musicnn_sessions(onnx_sessions, context="finally")
+            release_album_sessions(onnx_sessions, context="finally")
             onnx_sessions = None
             try:
                 comprehensive_memory_cleanup(force_cuda=True, reset_onnx_pool=True)

@@ -418,6 +418,9 @@ RUN set -ux; \
 FROM base AS libraries
 
 ARG BASE_IMAGE
+# Set to 1 to install the optional MERT sonic backend (torch + transformers
+# already come via gpu.txt/common.txt; this adds the MERT-specific pins).
+ARG INSTALL_MERT=0
 
 WORKDIR /app
 
@@ -436,6 +439,15 @@ RUN rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED; \
     else \
         echo "CPU base image: installing all packages together for dependency resolution"; \
         uv pip install --system --no-cache --index-strategy unsafe-best-match -r /app/requirements/cpu.txt -r /app/requirements/common.txt || exit 1; \
+    fi \
+    && if [ "$INSTALL_MERT" = "1" ]; then \
+        if [[ "$BASE_IMAGE" =~ ^nvidia/cuda: ]]; then \
+            echo "INSTALL_MERT=1 (GPU): adding CUDA torch + MERT runtime deps"; \
+            uv pip install --system --no-cache --index-strategy unsafe-best-match -r /app/requirements/mert-gpu.txt || exit 1; \
+        else \
+            echo "INSTALL_MERT=1 (CPU): adding torch + MERT runtime deps"; \
+            uv pip install --system --no-cache --index-strategy unsafe-best-match -r /app/requirements/mert.txt || exit 1; \
+        fi; \
     fi \
     && echo "Verifying psycopg2 installation..." \
     && python3 -c "import psycopg2; print('psycopg2 OK')" \

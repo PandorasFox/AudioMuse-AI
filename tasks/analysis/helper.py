@@ -156,13 +156,24 @@ def attach_catalog_item_ids(tracks, server_id=None):
 
 
 def get_existing_track_ids(track_ids):
+    """Return the subset of track_ids already fully analyzed under the
+    *active* sonic backend.
+
+    The ``embedding`` join is filtered by ``backend`` so that after a
+    ``SONIC_BACKEND`` switch, tracks that only have the previous backend's
+    embedding row are reported as needing re-analysis (their new-backend
+    row is written alongside the old one via the composite (item_id,
+    backend) primary key).
+    """
     if not track_ids:
         return set()
+    from ..sonic_backends import active_backend_name
     with get_db() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT s.item_id FROM score s JOIN embedding e ON s.item_id = e.item_id "
+            "SELECT s.item_id FROM score s "
+            "JOIN embedding e ON s.item_id = e.item_id AND e.backend = %s "
             f"WHERE s.item_id IN %s AND {_WORK_ANALYZED}",
-            (tuple(_str_ids(track_ids)),),
+            (active_backend_name(), tuple(_str_ids(track_ids))),
         )
         return {row[0] for row in cur.fetchall()}
 
@@ -478,13 +489,15 @@ def _work_map_scan(cur, sql, params, work_map, chunk_size):
 
 
 def _work_sql(clap_available, lyrics_enabled):
+    from ..sonic_backends import backend_sql_literal
+    backend_lit = backend_sql_literal()
     mapped_selects, mapped_joins = _work_feature_parts(clap_available, lyrics_enabled, 'm.item_id')
     mapped_sql = (
         "SELECT m.provider_track_id, "
         f"(e.item_id IS NOT NULL AND {_WORK_ANALYZED}), {', '.join(mapped_selects)} "
         "FROM track_server_map m "
         "JOIN score s ON s.item_id = m.item_id "
-        "LEFT JOIN embedding e ON e.item_id = m.item_id "
+        f"LEFT JOIN embedding e ON e.item_id = m.item_id AND e.backend = {backend_lit} "
         f"{mapped_joins} "
         "WHERE m.server_id = %s"
     )
@@ -492,7 +505,7 @@ def _work_sql(clap_available, lyrics_enabled):
     legacy_sql = (
         f"SELECT s.item_id, TRUE, {', '.join(legacy_selects)} "
         "FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
+        f"JOIN embedding e ON e.item_id = s.item_id AND e.backend = {backend_lit} "
         f"{legacy_joins} "
         f"WHERE s.item_id NOT LIKE 'fp\\_%%' AND {_WORK_ANALYZED}"
     )
@@ -546,8 +559,12 @@ def album_work_masks(provider_ids, server_id, clap_available, lyrics_enabled):
 
 
 def _fetch_embedding_blob(item_id):
+    from ..sonic_backends import active_backend_name
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT embedding FROM embedding WHERE item_id = %s", (str(item_id),))
+        cur.execute(
+            "SELECT embedding FROM embedding WHERE item_id = %s AND backend = %s",
+            (str(item_id), active_backend_name()),
+        )
         row = cur.fetchone()
     return bytes(row[0]) if row and row[0] is not None else None
 

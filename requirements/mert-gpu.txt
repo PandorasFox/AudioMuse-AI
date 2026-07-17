@@ -1,0 +1,18 @@
+# GPU variant of mert.txt for SONIC_BACKEND=mert on an NVIDIA base image.
+#
+# The Dockerfile installs this (instead of requirements/mert.txt) when the
+# base image is nvidia/cuda:* AND --build-arg INSTALL_MERT=1. The only
+# difference from mert.txt is the torch wheel index: CUDA builds so MERT
+# inference runs on the GPU instead of falling back to CPU.
+#
+# cu124 wheels are used: torch 2.6.0 ships cu118/cu124/cu126 builds and the
+# cu124 runtime is forward-compatible with the CUDA 12.8 base image / driver.
+# torch wheels bundle their own CUDA runtime libraries, so this does not need
+# to match the base image's CUDA minor version exactly.
+#
+# Keep the torch floor (>=2.6) in sync with mert.txt: MERT-v1-95M/-330M load
+# pickle .bin checkpoints via trust_remote_code=True, which transformers
+# refuses under torch < 2.6 (CVE-mitigated torch.load gate).
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
+torchaudio==2.6.0

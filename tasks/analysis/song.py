@@ -38,6 +38,7 @@ from config import (
     AUDIO_LOAD_TIMEOUT,
     OTHER_FEATURE_LABELS,
     PER_SONG_MODEL_RELOAD,
+    SONIC_BACKEND,
 )
 from database import (
     get_db,
@@ -107,7 +108,14 @@ def resolve_providers(allow_coreml=False, cuda_options=None):
     available = ort.get_available_providers()
     chain = []
 
-    if 'CUDAExecutionProvider' in available:
+    # Opt-in: pin all ONNX models (MusiCNN / CLAP) to CPU even on a GPU box.
+    # MERT runs on torch and is unaffected, so this leaves *only* MERT on the
+    # GPU. Use it when several analysis workers share one GPU: the
+    # onnxruntime-gpu BFC arena balloons multi-GB on long tracks and OOMs the
+    # device, whereas these models run fine on spare CPU cores.
+    force_cpu = os.environ.get('ONNX_FORCE_CPU', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+    if not force_cpu and 'CUDAExecutionProvider' in available:
         chain.append(
             (
                 'CUDAExecutionProvider',
@@ -121,7 +129,7 @@ def resolve_providers(allow_coreml=False, cuda_options=None):
             )
         )
 
-    if allow_coreml and 'CoreMLExecutionProvider' in available:
+    if not force_cpu and allow_coreml and 'CoreMLExecutionProvider' in available:
         chain.append(
             (
                 'CoreMLExecutionProvider',
@@ -472,7 +480,100 @@ def _run_musicnn_models(final_patches, mood_labels_list, model_paths, onnx_sessi
                 logger.warning(f"Error during cleanup: {cleanup_error}")
 
 
+def _get_sonic_backend():
+    """Return the configured :class:`SonicBackend` singleton.
+
+    Imported lazily so the app stays bootable when an optional backend's
+    dependencies (e.g. torch/transformers for MERT) are not installed.
+    """
+    from ..sonic_backends import get_backend
+    return get_backend(SONIC_BACKEND)
+
+
+def _backend_load_sessions():
+    """Backend-aware replacement for ``load_musicnn_sessions(model_paths)``.
+
+    The active backend knows its own model paths, so no arguments are
+    needed. Returns the backend's opaque per-album session object.
+    """
+    return _get_sonic_backend().load_sessions()
+
+
+def _backend_cleanup_sessions(sessions, context=""):
+    if sessions is None:
+        return
+    try:
+        _get_sonic_backend().cleanup_sessions(sessions, context=context)
+    except Exception as e:
+        logger.warning(f"Error during backend session cleanup: {e}")
+
+
+def _analyze_track_via_backend(*, file_path, mood_labels_list, sessions, return_audio):
+    """Backend-routed equivalent of :func:`analyze_track`.
+
+    Mirrors the legacy return-tuple shape exactly: ``(analysis, embedding)``
+    or, when ``return_audio``, ``(analysis, embedding, audio, sr)``. Loads
+    audio at the backend's ``target_sr`` and delegates the audio->(embedding,
+    moods) computation to ``backend.analyze``; basic features (tempo/key/
+    scale/energy) are still computed here so every backend produces the same
+    ``score`` columns.
+    """
+    backend = _get_sonic_backend()
+    name = os.path.basename(file_path)
+    logger.info(f"Starting analysis for: {name} (backend={backend.name})")
+    nothing = (None, None, None, None) if return_audio else (None, None)
+
+    audio, sr = robust_load_audio_with_fallback(file_path, target_sr=backend.target_sr)
+    if audio is None or not np.any(audio) or audio.size == 0:
+        logger.warning(f"Could not load a valid audio signal for {name}. Skipping track.")
+        return nothing
+
+    tempo, average_energy, musical_key, scale = extract_basic_features(audio, sr)
+
+    try:
+        result = backend.analyze(
+            audio, sr, sessions,
+            file_basename=name, mood_labels=mood_labels_list,
+        )
+    except Exception as e:
+        logger.exception("Backend '%s' inference failed for %s: %s", backend.name, name, e)
+        return nothing
+
+    if result is None:
+        return nothing
+
+    processed_embedding, moods = result
+    analysis_result = {
+        "tempo": tempo, "key": musical_key, "scale": scale,
+        "moods": moods, "energy": average_energy,
+    }
+
+    return_values = (
+        (analysis_result, processed_embedding, audio, sr) if return_audio
+        else (analysis_result, processed_embedding)
+    )
+    try:
+        if not return_audio:
+            del audio, sr
+        gc.collect()
+        comprehensive_memory_cleanup(force_cuda=False, reset_onnx_pool=False)
+    except Exception as cleanup_error:
+        logger.warning(f"Error during final tensor cleanup: {cleanup_error}")
+    return return_values
+
+
 def analyze_track(file_path, mood_labels_list, model_paths, onnx_sessions=None, return_audio=False):
+    # Route non-default backends (e.g. MERT) through the pluggable path. The
+    # MusiCNN default falls through to the original inline pipeline below,
+    # unchanged, so tests that patch ``tasks.analysis.song.ort`` still work.
+    if SONIC_BACKEND != "musicnn":
+        return _analyze_track_via_backend(
+            file_path=file_path,
+            mood_labels_list=mood_labels_list,
+            sessions=onnx_sessions,
+            return_audio=return_audio,
+        )
+
     name = os.path.basename(file_path)
     logger.info(f"Starting analysis for: {name}")
     nothing = (None, None, None, None) if return_audio else (None, None)
@@ -522,18 +623,42 @@ def provider_item_id(item):
 
 
 def ensure_musicnn_sessions(onnx_sessions, model_paths, session_recycler, album_name):
+    # For a non-default backend, load/recycle that backend's own opaque
+    # session object instead of MusiCNN ONNX sessions. The MusiCNN default
+    # keeps the original path exactly.
+    backend_mode = SONIC_BACKEND != "musicnn"
+    if backend_mode:
+        loader = _backend_load_sessions
+        cleaner = _backend_cleanup_sessions
+    else:
+        loader = lambda: load_musicnn_sessions(model_paths)
+        cleaner = cleanup_musicnn_sessions
+
     if onnx_sessions is None:
-        logger.info(f"Lazy-loading MusiCNN models for album: {album_name}")
-        return load_musicnn_sessions(model_paths)
+        logger.info(f"Lazy-loading analysis models for album: {album_name}")
+        return loader()
     if not session_recycler.should_recycle():
         return onnx_sessions
     logger.info(
-        f"Recycling ONNX sessions after {session_recycler.get_use_count()} tracks"
+        f"Recycling analysis sessions after {session_recycler.get_use_count()} tracks"
     )
-    cleanup_musicnn_sessions(onnx_sessions, context="recycle")
+    cleaner(onnx_sessions, context="recycle")
     comprehensive_memory_cleanup(force_cuda=True, reset_onnx_pool=True)
     session_recycler.mark_recycled()
-    return load_musicnn_sessions(model_paths)
+    return loader()
+
+
+def release_album_sessions(onnx_sessions, context=""):
+    """Backend-aware album-level session cleanup.
+
+    Companion to :func:`ensure_musicnn_sessions`: routes end-of-album
+    teardown through the active backend so MERT (or any backend) releases
+    its own resources, while MusiCNN keeps the original direct path.
+    """
+    if SONIC_BACKEND != "musicnn":
+        _backend_cleanup_sessions(onnx_sessions, context=context)
+    else:
+        cleanup_musicnn_sessions(onnx_sessions, context=context)
 
 
 def run_clap_for_track(path, track_name_full):

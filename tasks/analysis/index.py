@@ -48,10 +48,15 @@ def _run_all_index_builds(log_fn=None, progress_start=95, progress_end=98):
     from ..lyrics_manager import build_and_store_lyrics_index, build_and_store_lyrics_axes_index
     from ..sem_grove_manager import build_and_store_sem_grove_index
     from ..artist_gmm_manager import build_and_store_artist_index
+    from ..mood_centroids_manager import build_and_store_mood_centroids
 
     steps = (
         ("IVF index rebuilt", "Building IVF audio index...",
          lambda: build_and_store_ivf_index(get_db()), True),
+        # Per-backend mood centroids are derived from the same embeddings that
+        # just went into the audio index, so rebuild them right after it.
+        ("Mood centroids rebuilt", "Building per-backend mood centroids...",
+         lambda: build_and_store_mood_centroids(get_db()), False),
         ("CLAP text search index", "Building CLAP text search index...",
          lambda: build_and_store_clap_index(get_db()), False),
         ("Lyrics search index", "Building lyrics search index...",

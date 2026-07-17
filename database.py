@@ -441,13 +441,14 @@ def get_tracks_by_ids(item_ids_list):
 
     item_ids_str = [str(item_id) for item_id in item_ids_list]
 
+    from tasks.sonic_backends import active_backend_name
     query = """
         SELECT s.item_id, s.title, s.author, s.album, s.album_artist, s.tempo, s.key, s.scale, s.mood_vector, s.energy, s.other_features, s.year, s.rating, s.file_path, e.embedding
         FROM score s
-        LEFT JOIN embedding e ON s.item_id = e.item_id
+        LEFT JOIN embedding e ON s.item_id = e.item_id AND e.backend = %s
         WHERE s.item_id IN %s
     """
-    cur.execute(query, (tuple(item_ids_str),))
+    cur.execute(query, (active_backend_name(), tuple(item_ids_str)))
     rows = cur.fetchall()
     cur.close()
 
@@ -666,14 +667,19 @@ def save_track_analysis_and_embedding(
             ),
         )
 
+        # Save embedding under the active sonic backend's namespace. The
+        # composite (item_id, backend) PK lets every backend keep its own
+        # embedding row alongside the others, so switching SONIC_BACKEND
+        # does not destroy the previous backend's data.
         if isinstance(embedding_vector, np.ndarray) and embedding_vector.size > 0:
+            from tasks.sonic_backends import active_backend_name
             embedding_blob = embedding_vector.astype(np.float32).tobytes()
             cur.execute(
                 """
-                INSERT INTO embedding (item_id, embedding) VALUES (%s, %s)
-                ON CONFLICT (item_id) DO UPDATE SET embedding = EXCLUDED.embedding
+                INSERT INTO embedding (item_id, backend, embedding) VALUES (%s, %s, %s)
+                ON CONFLICT (item_id, backend) DO UPDATE SET embedding = EXCLUDED.embedding
             """,
-                (item_id, psycopg2.Binary(embedding_blob)),
+                (item_id, active_backend_name(), psycopg2.Binary(embedding_blob)),
             )
 
         conn.commit()
@@ -1124,14 +1130,41 @@ def init_db():
                     note TEXT
                 )
             """)
+            # 'embedding' table. Composite (item_id, backend) primary key so
+            # each sonic backend stores its own embedding alongside the
+            # others — switching SONIC_BACKEND no longer destroys the
+            # outgoing backend's data.
             cur.execute(
-                "CREATE TABLE IF NOT EXISTS embedding (item_id TEXT PRIMARY KEY, FOREIGN KEY (item_id) REFERENCES score (item_id) ON DELETE CASCADE)"
+                "CREATE TABLE IF NOT EXISTS embedding (item_id TEXT, FOREIGN KEY (item_id) REFERENCES score (item_id) ON DELETE CASCADE)"
             )
             cur.execute(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'embedding' AND column_name = 'embedding')"
             )
             if not cur.fetchone()[0]:
                 cur.execute("ALTER TABLE embedding ADD COLUMN embedding BYTEA")
+            # backend column: pre-existing rows were all written by MusiCNN
+            # (the only backend before this column existed), so backfill with
+            # 'musicnn'. New rows always carry the producing backend name.
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'embedding' AND column_name = 'backend')"
+            )
+            if not cur.fetchone()[0]:
+                cur.execute("ALTER TABLE embedding ADD COLUMN backend TEXT NOT NULL DEFAULT 'musicnn'")
+                logger.info("Added 'backend' column to embedding table (backfilled to 'musicnn')")
+            # Composite PK on (item_id, backend). Covers both fresh installs
+            # (no PK on the CREATE TABLE above) and legacy upgrades where the
+            # single-column (item_id) PK still exists.
+            cur.execute("""
+                SELECT a.attname FROM pg_index i
+                JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                WHERE i.indrelid = 'embedding'::regclass AND i.indisprimary
+                ORDER BY a.attname
+            """)
+            pk_cols = sorted(r[0] for r in cur.fetchall())
+            if pk_cols != ['backend', 'item_id']:
+                cur.execute("ALTER TABLE embedding DROP CONSTRAINT IF EXISTS embedding_pkey")
+                cur.execute("ALTER TABLE embedding ADD PRIMARY KEY (item_id, backend)")
+                logger.info("Set embedding PK to (item_id, backend)")
             cur.execute(
                 "CREATE TABLE IF NOT EXISTS lyrics_embedding (item_id TEXT PRIMARY KEY, FOREIGN KEY (item_id) REFERENCES score (item_id) ON DELETE CASCADE)"
             )
@@ -1160,6 +1193,21 @@ def init_db():
             )
             if not cur.fetchone()[0]:
                 cur.execute("ALTER TABLE clap_embedding ADD COLUMN embedding BYTEA")
+            # Per-backend mood centroids derived from each backend's own
+            # embeddings + score.other_features (rebuilt at the end of every
+            # analysis). Replaces the static, 200-dim MusiCNN-only
+            # mood_centroids_real_080_clap.json so Similarity/Alchemy/Path
+            # work for any active SONIC_BACKEND.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS mood_centroids_data (
+                    backend       TEXT NOT NULL,
+                    mood          TEXT NOT NULL,
+                    centroids     JSONB NOT NULL,
+                    embedding_dim INTEGER NOT NULL,
+                    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (backend, mood)
+                )
+            """)
             cur.execute("DROP TABLE IF EXISTS voyager_index_data")
             cur.execute("DROP TABLE IF EXISTS clap_index_data")
             cur.execute("DROP TABLE IF EXISTS lyrics_index_data")
