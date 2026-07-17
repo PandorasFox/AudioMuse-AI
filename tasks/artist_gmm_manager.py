@@ -288,10 +288,11 @@ def _artist_batches(pending, artist_tracks):
 
 def _artist_jobs(cur, batch, artist_tracks, artist_track_hashes):
     """Fetch one batch of artists' embeddings and pack them into fit jobs."""
+    from tasks.sonic_backends import backend_sql_literal
     wanted = [track['item_id'] for name in batch for track in artist_tracks[name]]
     cur.execute(
         "SELECT item_id, embedding FROM embedding "
-        "WHERE item_id = ANY(%s) AND embedding IS NOT NULL",
+        f"WHERE item_id = ANY(%s) AND embedding IS NOT NULL AND backend = {backend_sql_literal()}",
         (wanted,),
     )
     vectors = {
@@ -566,6 +567,7 @@ def get_representative_songs_for_component(
     artist_name: str, component_index: int, top_k: int = 3
 ) -> List[Dict]:
     from app_helper import get_db
+    from tasks.sonic_backends import backend_sql_literal
 
     if artist_gmm_params is None or artist_name not in artist_gmm_params:
         logger.warning(f"No GMM found for artist '{artist_name}'")
@@ -585,10 +587,10 @@ def get_representative_songs_for_component(
 
     try:
         cur.execute(
-            """
+            f"""
             SELECT s.item_id, s.title, e.embedding
             FROM score s
-            JOIN embedding e ON s.item_id = e.item_id
+            JOIN embedding e ON s.item_id = e.item_id AND e.backend = {backend_sql_literal()}
             WHERE s.author = %s AND e.embedding IS NOT NULL
             ORDER BY s.title
         """,

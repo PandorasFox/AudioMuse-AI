@@ -148,9 +148,10 @@ def get_embedding_endpoint():
             return jsonify({"error": str(exc)}), 400
         if not item_id:
             return jsonify({"error": f"Embedding not found for id: {raw_id}"}), 404
+        from tasks.sonic_backends import backend_sql_literal
         db = get_db()
         with db.cursor(cursor_factory=DictCursor) as cur:
-            cur.execute("SELECT * FROM embedding WHERE item_id = %s", (item_id,))
+            cur.execute(f"SELECT * FROM embedding WHERE item_id = %s AND backend = {backend_sql_literal()}", (item_id,))
             embedding_data = cur.fetchone()
 
         if embedding_data:

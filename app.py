@@ -922,6 +922,15 @@ def listen_for_index_reloads():
                             logger.warning(f"SemGrove cache reload failed: {e}")
                             sg_success = False
 
+                        # Refresh the per-backend mood centroid cache so the
+                        # next Path request picks up the freshly-rebuilt
+                        # mood_centroids_data rows.
+                        try:
+                            import app_path as _ap
+                            _ap._load_mood_centroids()
+                        except Exception as e:
+                            logger.warning(f"Mood centroid cache reload failed: {e}")
+
                         logger.info(
                             f"In-memory reload complete: IVF OK, Artist OK, Maps OK, CLAP {'OK' if clap_success else 'X'}, Lyrics {'OK' if lyrics_success else 'X'}, SemGrove {'OK' if sg_success else 'X'}"
                         )

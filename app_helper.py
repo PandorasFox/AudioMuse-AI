@@ -235,13 +235,14 @@ def build_and_store_map_projection(index_name='main_map'):
 
     from config import EMBEDDING_DIMENSION
     from tasks.index_build_helpers import stream_embeddings_to_buffer
+    from tasks.sonic_backends import backend_sql_literal
 
     try:
         mat, ids = stream_embeddings_to_buffer(
             table="embedding",
             column="embedding",
             dim=EMBEDDING_DIMENSION,
-            where_clause="embedding IS NOT NULL",
+            where_clause=f"embedding IS NOT NULL AND backend = {backend_sql_literal()}",
         )
     except Exception:
         logger.exception("Failed to stream embeddings for map projection")

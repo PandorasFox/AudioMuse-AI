@@ -146,6 +146,7 @@ def _confirm_candidates(cur, ids, left, right):
     """
     if left.size == 0:
         return left, right
+    from tasks.sonic_backends import backend_sql_literal
     order = np.lexsort((right, left))
     left = left[order]
     right = right[order]
@@ -170,7 +171,7 @@ def _confirm_candidates(cur, ids, left, right):
             for chunk in range(0, rows.size, _CHUNK_ROWS):
                 wanted = [ids[int(row)] for row in rows[chunk:chunk + _CHUNK_ROWS]]
                 fetch.execute(
-                    "SELECT item_id, embedding FROM embedding WHERE item_id = ANY(%s)",
+                    f"SELECT item_id, embedding FROM embedding WHERE item_id = ANY(%s) AND backend = {backend_sql_literal()}",
                     (wanted,),
                 )
                 for item_id, blob in fetch.fetchall():
@@ -216,10 +217,11 @@ def _build_mapping(cur):
     here). The answer is identical either way: a track merges into the nearest
     earlier row that the cosine confirms.
     """
+    from tasks.sonic_backends import backend_sql_literal
     head_len = simhash.CANONICAL_ID_LEN
     cur.execute(
         "SELECT COUNT(*) FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
+        f"JOIN embedding e ON e.item_id = s.item_id AND e.backend = {backend_sql_literal()} "
         "WHERE e.embedding IS NOT NULL AND " + _LEGACY_ROW_SQL,
         (head_len,),
     )
@@ -228,7 +230,7 @@ def _build_mapping(cur):
         return {}, {}
     cur.execute(
         "SELECT COUNT(*) FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
+        f"JOIN embedding e ON e.item_id = s.item_id AND e.backend = {backend_sql_literal()} "
         "WHERE e.embedding IS NOT NULL AND " + _CURRENT_SCHEME_SQL,
         (head_len,),
     )
@@ -256,14 +258,14 @@ def _build_mapping(cur):
     canonical_loaded = _hash_catalogue(
         cur,
         "SELECT s.item_id, e.embedding FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
+        f"JOIN embedding e ON e.item_id = s.item_id AND e.backend = {backend_sql_literal()} "
         "WHERE e.embedding IS NOT NULL AND " + _CURRENT_SCHEME_SQL,
         (head_len,), ids, packed, valid, 0,
     )
     legacy_loaded = _hash_catalogue(
         cur,
         "SELECT s.item_id, e.embedding FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
+        f"JOIN embedding e ON e.item_id = s.item_id AND e.backend = {backend_sql_literal()} "
         "WHERE e.embedding IS NOT NULL AND " + _LEGACY_ROW_SQL,
         (head_len,), ids, packed, valid, canonical_loaded,
     )

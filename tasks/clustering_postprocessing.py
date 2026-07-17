@@ -34,10 +34,11 @@ logger = logging.getLogger(__name__)
 
 
 def get_vectors_from_database(item_ids: list, db_conn):
+    from tasks.sonic_backends import backend_sql_literal
     vectors_map = {}
 
     with db_conn.cursor(cursor_factory=DictCursor) as cur:
-        cur.execute("SELECT item_id, embedding FROM embedding WHERE item_id = ANY(%s)", (item_ids,))
+        cur.execute(f"SELECT item_id, embedding FROM embedding WHERE item_id = ANY(%s) AND backend = {backend_sql_literal()}", (item_ids,))
         rows = cur.fetchall()
 
         for row in rows:

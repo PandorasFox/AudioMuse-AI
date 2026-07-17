@@ -103,10 +103,11 @@ def _count_gmm_eligible_artists(cur):
     ``artist_map``, which is 0 whenever the index failed to load and is not the
     same population as ``distinct_artists`` (which includes artists with no
     embedding at all)."""
+    from tasks.sonic_backends import backend_sql_literal
     return _counted_or_none(
         cur,
         "SELECT COUNT(DISTINCT s.author) FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
+        f"JOIN embedding e ON e.item_id = s.item_id AND e.backend = {backend_sql_literal()} "
         "WHERE s.author IS NOT NULL AND s.author <> ''",
     )
 

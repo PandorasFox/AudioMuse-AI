@@ -112,18 +112,13 @@ def _get_artist_gmm_vectors_and_weights(
     return [means[i] for i in range(len(means))], weights.tolist()
 
 
-_mood_centroids_cache = None
-_mood_centroids_lock = threading.Lock()
-
-
 def _load_mood_centroids_data():
-    global _mood_centroids_cache
-    if _mood_centroids_cache is None:
-        with _mood_centroids_lock:
-            if _mood_centroids_cache is None:
-                with open(config.MOOD_CENTROIDS_FILE, encoding='utf-8') as _f:
-                    _mood_centroids_cache = json.load(_f)
-    return _mood_centroids_cache
+    # Backend-aware: reads the active backend's centroids from the
+    # mood_centroids_data table (rebuilt at the end of every analysis),
+    # with a first-boot fallback to the legacy JSON for musicnn. Read
+    # fresh so a re-analysis is picked up without a process restart.
+    from .mood_centroids_manager import load_mood_centroids
+    return load_mood_centroids()
 
 
 def _get_mood_centroid_vector(item_id: str):
@@ -139,7 +134,7 @@ def _get_mood_centroid_vector(item_id: str):
             vec = centroids_list[cidx].get('centroid')
             if vec:
                 return np.array(vec, dtype=float)
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, KeyError) as exc:
         logger.warning(f"Failed to load mood centroid from '{item_id}': {exc}")
     return None
 

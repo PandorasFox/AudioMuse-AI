@@ -110,6 +110,7 @@ def build_and_store_sem_grove_index(db_conn=None) -> bool:
     from config import LYRICS_EMBEDDING_DIMENSION, EMBEDDING_DIMENSION
     from .index_build_helpers import stream_embeddings_to_buffer
     from .paged_ivf import build_and_store_paged_ivf
+    from tasks.sonic_backends import backend_sql_literal
 
     if db_conn is None:
         db_conn = get_db()
@@ -138,7 +139,7 @@ def build_and_store_sem_grove_index(db_conn=None) -> bool:
             table="embedding",
             column="embedding",
             dim=audio_dim,
-            where_clause="embedding IS NOT NULL",
+            where_clause=f"embedding IS NOT NULL AND backend = {backend_sql_literal()}",
         )
         if audio_buf.shape[0] == 0:
             logger.warning("SemGrove: no audio embeddings found; aborting.")

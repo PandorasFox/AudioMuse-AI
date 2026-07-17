@@ -182,10 +182,11 @@ def _fetch_f32_embeddings(db_conn, item_ids) -> dict:
     if not item_ids:
         return {}
     out: dict = {}
+    from tasks.sonic_backends import backend_sql_literal
     try:
         with db_conn.cursor() as cur:
             cur.execute(
-                "SELECT item_id, embedding FROM embedding WHERE item_id = ANY(%s) AND embedding IS NOT NULL",
+                f"SELECT item_id, embedding FROM embedding WHERE item_id = ANY(%s) AND embedding IS NOT NULL AND backend = {backend_sql_literal()}",
                 (list(item_ids),),
             )
             for item_id, emb in cur.fetchall():
@@ -320,6 +321,7 @@ def build_and_store_ivf_index(db_conn=None):
 
     from .index_build_helpers import stream_embeddings_to_buffer
     from .paged_ivf import build_and_store_paged_ivf
+    from tasks.sonic_backends import backend_sql_literal
 
     logger.info("Starting to build and store audio IVF index (disk-paged)...")
     try:
@@ -327,7 +329,7 @@ def build_and_store_ivf_index(db_conn=None):
             table="embedding",
             column="embedding",
             dim=EMBEDDING_DIMENSION,
-            where_clause="embedding IS NOT NULL",
+            where_clause=f"embedding IS NOT NULL AND backend = {backend_sql_literal()}",
         )
         if buf.shape[0] == 0:
             logger.warning("No valid audio embeddings found for IVF index build. Aborting.")

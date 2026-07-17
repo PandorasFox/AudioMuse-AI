@@ -296,8 +296,11 @@ def _payload_page(cur, page, limit, include_embeddings, id_filter, server_id, pr
     select_extra = ""
     join_extra = ""
     if include_embeddings:
+        # ``musicnn_blob`` alias is kept for sync-protocol back-compat; it now
+        # carries the active backend's embedding, scoped via the backend column.
+        from tasks.sonic_backends import backend_sql_literal
         select_extra += ", e.embedding AS musicnn_blob"
-        join_extra += " LEFT JOIN embedding e ON e.item_id = s.item_id"
+        join_extra += f" LEFT JOIN embedding e ON e.item_id = s.item_id AND e.backend = {backend_sql_literal()}"
     if clap_on:
         select_extra += ", c.embedding AS clap_blob"
         join_extra += " LEFT JOIN clap_embedding c ON c.item_id = s.item_id"

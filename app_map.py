@@ -114,13 +114,14 @@ def build_map_cache():
     logger = logging.getLogger(__name__)
     logger.info('Building map JSON cache (this reads the DB once).')
 
+    from tasks.sonic_backends import backend_sql_literal
     conn = get_db()
     cur = conn.cursor()
     try:
-        cur.execute("""
+        cur.execute(f"""
             SELECT s.item_id, s.title, s.author, s.mood_vector, e.embedding
             FROM score s
-            JOIN embedding e ON s.item_id = e.item_id
+            JOIN embedding e ON s.item_id = e.item_id AND e.backend = {backend_sql_literal()}
         """)
         rows = cur.fetchall()
     finally:
