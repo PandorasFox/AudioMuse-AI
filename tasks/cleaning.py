@@ -40,7 +40,7 @@ from collections import defaultdict
 
 from rq import get_current_job
 
-from config import CLEANING_SAFETY_LIMIT
+from config import CLEANING_SAFETY_LIMIT, EMBEDDING_DIMENSION, SONIC_BACKEND
 
 from error import error_manager
 from error.error_dictionary import ERR_CLEANING_FAILED, ERR_DB_CONNECTION
@@ -174,10 +174,11 @@ def identify_and_clean_orphaned_albums_task():
                     present_canonical_ids.update(str(v) for v in mapping.values())
 
             log_and_update_main("Checking for catalogue tracks bound to no server...", 85)
+            from tasks.sonic_backends import backend_sql_literal
             with get_db() as conn, conn.cursor() as cur:
                 cur.execute(
                     "SELECT s.item_id FROM score s "
-                    "JOIN embedding e ON s.item_id = e.item_id"
+                    f"JOIN embedding e ON s.item_id = e.item_id AND e.backend = {backend_sql_literal()}"
                 )
                 database_track_ids = {row[0] for row in cur.fetchall()}
 
@@ -282,3 +283,143 @@ def identify_and_clean_orphaned_albums_task():
             raise
         finally:
             close_cancel()
+
+
+# --- Sonic-backend storage inspection / cleanup -----------------------------
+#
+# Per-backend storage means every backend's embedding rows live alongside
+# each other (composite (item_id, backend) PK on ``embedding``). The audio
+# similarity index (IVF) is always rebuilt from the *active* backend's
+# embeddings, so it needs no per-backend cleanup — but the raw per-backend
+# embedding rows and the per-(backend, mood) ``mood_centroids_data`` rows do.
+# The admin "Cleaning" panel uses these helpers to:
+#   * report per-backend embedding row counts so users can see what's on disk;
+#   * drop a specific backend's embedding + mood-centroid rows. The active
+#     backend is protected — switching away first is required to clear it.
+
+
+def _embedding_rows_for(cur, backend):
+    """Return (row_count, sampled_dim) for ``backend``'s embedding rows."""
+    cur.execute("SELECT COUNT(*) FROM embedding WHERE backend = %s", (backend,))
+    count = int((cur.fetchone() or (0,))[0] or 0)
+    sample_dim = None
+    if count > 0:
+        cur.execute(
+            "SELECT embedding FROM embedding "
+            "WHERE backend = %s AND embedding IS NOT NULL LIMIT 1",
+            (backend,),
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            raw = bytes(row[0])
+            if len(raw) % 4 == 0:
+                sample_dim = len(raw) // 4
+    return count, sample_dim
+
+
+def _mood_centroid_rows_for(cur, backend):
+    """Return the number of ``mood_centroids_data`` rows for ``backend``."""
+    cur.execute("SAVEPOINT mc_count")
+    try:
+        cur.execute("SELECT COUNT(*) FROM mood_centroids_data WHERE backend = %s", (backend,))
+        n = int((cur.fetchone() or (0,))[0] or 0)
+        cur.execute("RELEASE SAVEPOINT mc_count")
+        return n
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT mc_count")
+        return 0
+
+
+def inspect_sonic_state():
+    """Return per-backend embedding + mood-centroid state for the Cleaning UI.
+
+    Shape (JSON-safe; returned by ``GET /api/cleaning/sonic_state``):
+      * ``active_backend``: the SONIC_BACKEND currently writing data.
+      * ``active_dim``: the embedding dim that backend produces.
+      * ``backends``: list of ``{backend, embedding_row_count,
+        sample_stored_dim, mood_centroid_count, is_active}`` rows — one per
+        backend with any stored embeddings, plus the active backend even if
+        it currently has none.
+    """
+    from app_helper import get_db
+
+    snapshot = {
+        "active_backend": SONIC_BACKEND,
+        "active_dim": int(EMBEDDING_DIMENSION),
+        "backends": [],
+    }
+
+    try:
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT backend FROM embedding")
+            backends_with_emb = {r[0] for r in cur.fetchall() if r[0]}
+
+            backend_set = backends_with_emb | {SONIC_BACKEND}
+            for backend in sorted(backend_set):
+                emb_count, emb_dim = _embedding_rows_for(cur, backend)
+                snapshot["backends"].append({
+                    "backend": backend,
+                    "embedding_row_count": emb_count,
+                    "sample_stored_dim": emb_dim,
+                    "mood_centroid_count": _mood_centroid_rows_for(cur, backend),
+                    "is_active": backend == SONIC_BACKEND,
+                })
+    except Exception as e:
+        logger.warning(f"Failed to inspect sonic embedding state: {e}", exc_info=True)
+        snapshot["error"] = str(e)
+    return snapshot
+
+
+def clear_inactive_backend_data(backend):
+    """Drop one inactive backend's embedding + mood-centroid rows.
+
+    Refuses to operate on ``SONIC_BACKEND`` (a configuration swap must happen
+    first; otherwise the next analysis pass would simply repopulate the rows).
+    Only touches ``embedding`` rows where ``backend = X`` and that backend's
+    ``mood_centroids_data`` rows. The IVF/CLAP/lyrics/artist/score/playlist/
+    config tables are untouched (the IVF index is rebuilt from the active
+    backend's embeddings on the next analysis).
+
+    Returns a small summary dict for the API response.
+    """
+    if not backend or not isinstance(backend, str):
+        raise ValueError("backend must be a non-empty string")
+    if backend == SONIC_BACKEND:
+        raise ValueError(
+            f"Refusing to clear the active backend ({backend!r}). Set "
+            "SONIC_BACKEND to a different backend first, then come back "
+            "to this panel."
+        )
+
+    from app_helper import get_db
+
+    summary = {
+        "backend": backend,
+        "deleted_embeddings": 0,
+        "deleted_mood_centroids": 0,
+    }
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM embedding WHERE backend = %s", (backend,))
+        summary["deleted_embeddings"] = cur.rowcount or 0
+
+        # mood_centroids_data is per-(backend, mood). Table may not exist on a
+        # partial install; the SAVEPOINT lets us swallow the miss without
+        # aborting the surrounding transaction.
+        cur.execute("SAVEPOINT mood_centroids_delete")
+        try:
+            cur.execute("DELETE FROM mood_centroids_data WHERE backend = %s", (backend,))
+            summary["deleted_mood_centroids"] = cur.rowcount or 0
+            cur.execute("RELEASE SAVEPOINT mood_centroids_delete")
+        except Exception as e:
+            cur.execute("ROLLBACK TO SAVEPOINT mood_centroids_delete")
+            logger.info("mood_centroids_data not cleared (%s); skipping.", e)
+
+        conn.commit()
+
+    logger.info(
+        "Cleared inactive backend %r: %d embeddings, %d mood centroids. "
+        "(active backend remains %s/%d-dim.)",
+        backend, summary["deleted_embeddings"], summary["deleted_mood_centroids"],
+        SONIC_BACKEND, EMBEDDING_DIMENSION,
+    )
+    return summary

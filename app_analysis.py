@@ -214,3 +214,78 @@ def start_cleaning_endpoint():
         job_timeout=-1,  # No timeout
     )
     return jsonify({"task_id": job.id, "task_type": "cleaning", "status": job.get_status()}), 202
+
+
+@analysis_bp.route('/api/cleaning/sonic_state', methods=['GET'])
+def sonic_state_endpoint():
+    """Report per-backend embedding + mood-centroid state for the Cleaning UI.
+
+    Body shape (see ``tasks.cleaning.inspect_sonic_state``): ``active_backend``,
+    ``active_dim``, and a ``backends`` list with one row per backend that has
+    stored data (plus the active one). Each row carries ``embedding_row_count``,
+    ``sample_stored_dim``, ``mood_centroid_count`` and ``is_active``.
+    ---
+    tags:
+      - Cleaning
+    responses:
+      200:
+        description: Per-backend sonic state snapshot.
+    """
+    from tasks.cleaning import inspect_sonic_state
+    return jsonify(inspect_sonic_state()), 200
+
+
+@analysis_bp.route('/api/cleaning/sonic_state/clear', methods=['POST'])
+def sonic_state_clear_endpoint():
+    """Drop one inactive backend's embedding + mood-centroid rows.
+
+    Removes only the ``embedding`` rows whose ``backend`` column equals the
+    supplied value and that backend's ``mood_centroids_data`` rows. The active
+    ``SONIC_BACKEND`` is protected — switching ``SONIC_BACKEND`` first is
+    required to clear it. Untouched: the IVF/CLAP/lyrics/artist data,
+    playlists, app_config, task history, score rows.
+
+    Body: ``{"backend": "musicnn", "confirm": true}``. The confirm flag is
+    required so a stray fetch can't drop the rows.
+    ---
+    tags:
+      - Cleaning
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              backend:
+                type: string
+              confirm:
+                type: boolean
+    responses:
+      200:
+        description: Cleared. Body returns the summary + refreshed state.
+      400:
+        description: Missing/invalid backend, missing confirmation, or
+                     attempt to clear the active backend.
+      500:
+        description: Database error during cleanup.
+    """
+    data = request.json or {}
+    backend = (data.get('backend') or '').strip()
+    if not backend:
+        return jsonify({"error": "Missing 'backend' field."}), 400
+    if data.get('confirm') is not True:
+        return jsonify({
+            "error": "Refusing to clear without explicit confirmation.",
+            "hint": 'POST {"backend": "<name>", "confirm": true} to proceed.',
+        }), 400
+
+    from tasks.cleaning import clear_inactive_backend_data, inspect_sonic_state
+    try:
+        summary = clear_inactive_backend_data(backend)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("clear_inactive_backend_data failed: %s", e)
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"summary": summary, "state": inspect_sonic_state()}), 200

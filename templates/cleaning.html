@@ -63,6 +63,37 @@
             </div>
         </div>
     </section>
+
+    <!-- Sonic Backend Storage Section -->
+    <section id="sonic-state-section" style="margin-top: 2rem;">
+        <h2>Sonic Backend Storage</h2>
+        <p>
+            Each sonic backend (<code>musicnn</code>, <code>mert</code>, …)
+            stores its audio embeddings under its own <code>backend</code>
+            namespace in the <code>embedding</code> table, so the data from any
+            backend you've run survives switching to a different one. Use this
+            panel to inspect what each backend has on disk and to free space by
+            dropping a backend you're no longer using.
+        </p>
+        <p style="font-size: 0.9em; color: var(--muted, #888);">
+            The active backend is read-only here — to clear its data, switch
+            <code>SONIC_BACKEND</code> in your compose / env first and reload.
+            CLAP, lyrics, artist data, score, playlists, app config and task
+            history are never touched by this panel.
+        </p>
+
+        <div id="sonic-state-display" style="margin-bottom: 1rem;">
+            <p>Loading current state...</p>
+        </div>
+
+        <div class="task-buttons" style="margin-bottom: 1rem;">
+            <button id="refresh-sonic-state-btn">Refresh State</button>
+        </div>
+
+        <div id="sonic-state-result" style="display: none; margin-top: 1rem;" class="cleaning-summary">
+            <!-- Result populated by JS -->
+        </div>
+    </section>
 </div>
 {% endblock %}
 
@@ -83,11 +114,104 @@
         document.addEventListener('DOMContentLoaded', function() {
             loadTaskStateFromStorage();
             checkForExistingTask();
+            loadSonicState();
         });
 
         // Event listeners
         startCleanBtn.addEventListener('click', startCleaning);
         cancelCleanBtn.addEventListener('click', cancelCleaning);
+
+        // --- Sonic Backend Storage panel -----------------------------------
+        const sonicStateDisplay = document.getElementById('sonic-state-display');
+        const refreshSonicStateBtn = document.getElementById('refresh-sonic-state-btn');
+        const sonicStateResult = document.getElementById('sonic-state-result');
+        if (refreshSonicStateBtn) refreshSonicStateBtn.addEventListener('click', loadSonicState);
+
+        function fmtNum(n) { return (n === null || n === undefined) ? '—' : String(n); }
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+            }[c]));
+        }
+
+        function renderSonicState(state) {
+            if (!sonicStateDisplay) return;
+            if (state.error) {
+                sonicStateDisplay.innerHTML = '<p style="color:#c0392b;">Could not load sonic state: '
+                    + escapeHtml(state.error) + '</p>';
+                return;
+            }
+            const rows = (state.backends || []).map(b => {
+                const active = b.is_active;
+                const clearBtn = active
+                    ? '<span style="color: var(--muted,#888);">active (read-only)</span>'
+                    : '<button class="clear-backend-btn" data-backend="' + escapeHtml(b.backend)
+                      + '">Clear this backend</button>';
+                return '<tr' + (active ? ' style="font-weight:600;"' : '') + '>'
+                    + '<td>' + escapeHtml(b.backend) + (active ? ' ★' : '') + '</td>'
+                    + '<td>' + fmtNum(b.embedding_row_count) + '</td>'
+                    + '<td>' + fmtNum(b.sample_stored_dim) + '</td>'
+                    + '<td>' + fmtNum(b.mood_centroid_count) + '</td>'
+                    + '<td>' + clearBtn + '</td>'
+                    + '</tr>';
+            }).join('');
+            sonicStateDisplay.innerHTML =
+                '<p>Active backend: <code>' + escapeHtml(state.active_backend)
+                + '</code> (' + fmtNum(state.active_dim) + '-dim)</p>'
+                + '<table class="sonic-state-table" style="width:100%; border-collapse:collapse;">'
+                + '<thead><tr><th style="text-align:left;">Backend</th>'
+                + '<th style="text-align:left;">Embeddings</th>'
+                + '<th style="text-align:left;">Stored dim</th>'
+                + '<th style="text-align:left;">Mood centroids</th>'
+                + '<th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+            sonicStateDisplay.querySelectorAll('.clear-backend-btn').forEach(btn => {
+                btn.addEventListener('click', () => clearBackend(btn.dataset.backend));
+            });
+        }
+
+        async function loadSonicState() {
+            if (!sonicStateDisplay) return;
+            try {
+                const resp = await fetch('/api/cleaning/sonic_state');
+                renderSonicState(await resp.json());
+            } catch (e) {
+                sonicStateDisplay.innerHTML = '<p style="color:#c0392b;">Failed to fetch sonic state: '
+                    + escapeHtml(e.message || e) + '</p>';
+            }
+        }
+
+        async function clearBackend(backend) {
+            if (!confirm('Delete all stored embeddings and mood centroids for backend "'
+                + backend + '"? This cannot be undone.')) return;
+            try {
+                const resp = await fetch('/api/cleaning/sonic_state/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ backend: backend, confirm: true }),
+                });
+                const data = await resp.json();
+                if (sonicStateResult) {
+                    sonicStateResult.style.display = 'block';
+                    if (!resp.ok) {
+                        sonicStateResult.innerHTML = '<p style="color:#c0392b;">'
+                            + escapeHtml(data.error || 'Clear failed.') + '</p>';
+                    } else {
+                        const s = data.summary || {};
+                        sonicStateResult.innerHTML = '<p>Cleared backend <code>'
+                            + escapeHtml(s.backend) + '</code>: '
+                            + fmtNum(s.deleted_embeddings) + ' embeddings, '
+                            + fmtNum(s.deleted_mood_centroids) + ' mood centroids removed.</p>';
+                        if (data.state) renderSonicState(data.state);
+                    }
+                }
+            } catch (e) {
+                if (sonicStateResult) {
+                    sonicStateResult.style.display = 'block';
+                    sonicStateResult.innerHTML = '<p style="color:#c0392b;">Clear request failed: '
+                        + escapeHtml(e.message || e) + '</p>';
+                }
+            }
+        }
 
         // Save and load task state
         function saveTaskStateToStorage() {
